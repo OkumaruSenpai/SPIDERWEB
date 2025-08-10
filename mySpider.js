@@ -1,81 +1,84 @@
-// mySpider.js (diagnóstico)
-require('dotenv').config({ path: require('path').join(__dirname, '.env') });
-
+// mySpider.js (seguro para Railway)
+require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+
 const app = express();
-app.use(cors());
+app.disable('x-powered-by');
+app.use(helmet({
+  contentSecurityPolicy: false, // no servimos HTML dinámico aquí
+  crossOriginResourcePolicy: { policy: 'same-site' }
+}));
 
-const PORT = process.env.PORT || 3000;
-const TARGET_URL = process.env.TARGET_URL;
+// CORS: BLOQUEADO por defecto (solo si lo necesitas, abre orígenes específicos)
+// const cors = require('cors');
+// app.use(cors({ origin: ['https://tu-dominio'], methods: ['GET'] }));
 
-// Logs al iniciar (no imprime los secretos)
-console.log('cwd:', process.cwd());
-console.log('dirname:', __dirname);
-console.log('TARGET_URL:', TARGET_URL || '(no definida)');
-console.log('Tiene GITHUB_TOKEN?', Boolean(process.env.GITHUB_TOKEN));
-console.log('Tiene API_KEY?', Boolean(process.env.API_KEY));
+const PORT          = process.env.PORT || 3000;
+const TARGET_URL    = process.env.TARGET_URL;             // RAW del .lua o README
+const API_KEY       = process.env.API_KEY || '';          // requerido
+const GITHUB_TOKEN  = process.env.GITHUB_TOKEN || '';
+const SIGNING_SECRET = process.env.SIGNING_SECRET || '';  // opcional para HMAC
 
-app.get('/', (_req, res) => {
-  res.send('Servidor OK. Prueba /obtener-script');
-});
+// Rate limit (defensa básica)
+app.set('trust proxy', 1);
+app.use(rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false }));
 
-// Endpoint principal que usa env
-app.get('/obtener-script', async (_req, res) => {
-  try {
-    if (!TARGET_URL) return res.status(500).send('Falta TARGET_URL en .env');
+// --- Middleware auth con API Key ---
+function apiKeyGuard(req, res, next) {
+  if (!API_KEY) return res.status(500).json({ ok:false, code:'MISSING_API_KEY' });
+  const key = req.get('x-api-key');
+  if (key && key === API_KEY) return next();
+  return res.status(401).json({ ok:false, code:'UNAUTHORIZED' });
+}
 
-    const headers = {};
-    if (process.env.GITHUB_TOKEN) {
-      headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
-      headers['User-Agent'] = 'mySpiderApp';
-      headers.Accept = 'application/vnd.github+json';
-    }
-    if (process.env.API_KEY) {
-      headers['x-api-key'] = process.env.API_KEY;
-    }
+// --- (Opcional) Firma HMAC: x-sign y x-ts ---
+// En Roblox firmas body vacío: HMAC_SHA256( ts + '\n' + 'GET /obtener-script' , SIGNING_SECRET )
+const crypto = require('crypto');
+function hmacGuard(req, res, next) {
+  if (!SIGNING_SECRET) return next(); // desactivado si no hay secreto
+  const ts = req.get('x-ts');
+  const sig = req.get('x-sign');
+  if (!ts || !sig) return res.status(401).json({ ok:false, code:'MISSING_SIGNATURE' });
 
-    console.log('Llamando a:', TARGET_URL, 'con headers:', Object.keys(headers));
-    const r = await axios.get(TARGET_URL, { headers, timeout: 15000 });
-    console.log('Respuesta externa:', r.status);
-    res.status(r.status).send(r.data);
-  } catch (error) {
-    const status = error.response?.status || 500;
-    const body = error.response?.data || error.message;
-    console.error('Fallo en axios:', status, body);
-    res.status(status).send(body);
+  // Evita replays (5 min)
+  const drift = Math.abs(Date.now() - Number(ts));
+  if (!Number.isFinite(+ts) || drift > 5 * 60 * 1000) {
+    return res.status(401).json({ ok:false, code:'STALE_TIMESTAMP' });
   }
-});
 
-// PRUEBA 1: endpoint público de GitHub (sin token)
-app.get('/debug/github-public', async (_req, res) => {
+  const base = `${ts}\nGET /obtener-script`;
+  const expected = crypto.createHmac('sha256', SIGNING_SECRET).update(base).digest('hex');
+  if (crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig))) return next();
+  return res.status(401).json({ ok:false, code:'BAD_SIGNATURE' });
+}
+
+// --- Raíz: no revelar info ---
+app.get('/', (_req, res) => res.status(404).send(''));
+
+// --- ÚNICO endpoint expuesto ---
+app.get('/obtener-script', apiKeyGuard, hmacGuard, async (req, res) => {
   try {
-    const r = await axios.get('https://api.github.com/rate_limit', {
-      headers: { 'User-Agent': 'mySpiderApp' }
-    });
-    res.status(r.status).send(r.data);
+    if (!TARGET_URL) return res.status(500).json({ ok:false, code:'MISSING_TARGET_URL' });
+
+    const headers = { 'User-Agent': 'spiderweb-proxy', 'Accept': 'text/plain' };
+    if (GITHUB_TOKEN) headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
+
+    const r = await axios.get(TARGET_URL, { headers, responseType: 'text', timeout: 15000 });
+
+    // No caches largas en intermediarios
+    res.set('Cache-Control', 'no-store');
+    res.type('text/plain').status(200).send(r.data);
   } catch (e) {
-    res.status(e.response?.status || 500).send(e.response?.data || e.message);
+    const status = e.response?.status || 500;
+    res.status(status).json({ ok:false, code:'UPSTREAM_ERROR', status, detail: e.message });
   }
 });
 
-// PRUEBA 2: endpoint autenticado de GitHub (requiere token)
-app.get('/debug/github-me', async (_req, res) => {
-  try {
-    const r = await axios.get('https://api.github.com/user', {
-      headers: {
-        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-        'User-Agent': 'mySpiderApp',
-        Accept: 'application/vnd.github+json'
-      }
-    });
-    res.status(r.status).send({ login: r.data.login, id: r.data.id });
-  } catch (e) {
-    res.status(e.response?.status || 500).send(e.response?.data || e.message);
-  }
-});
+// Nada de rutas de debug en producción
 
 app.listen(PORT, () => {
-  console.log(`Servidor corriendo en http://localhost:${PORT}`);
+  console.log(`Servidor listo en :${PORT}`);
 });
