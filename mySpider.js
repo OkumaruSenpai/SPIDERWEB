@@ -1,84 +1,82 @@
 // server.js
+// Express con clave API (x-api-key) para proteger /obtener-script
+// Responde 401 "No autorizado" si falta o es incorrecta la clave.
+
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const express = require('express');
 const axios = require('axios');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.disable('x-powered-by');
-app.use(helmet({
-  crossOriginResourcePolicy: false,
-}));
-app.use(express.json({ limit: '64kb' }));
 
-const PORT       = process.env.PORT || 3000;
-const TARGET_URL = process.env.TARGET_URL;
-const API_KEY    = process.env.API_KEY;           // <-- rotar y mantener en .env
-const UA_LOCK    = process.env.UA_LOCK || 'rbx-spider/1'; // opcional
+const PORT        = process.env.PORT || 3000;
+const TARGET_URL  = process.env.TARGET_URL;       // URL del script remoto (GitHub/raw/lo que uses)
+const API_KEY     = process.env.API_KEY;          // Clave que deben enviar los clientes
+const DEBUG_ROUTES = process.env.DEBUG_ROUTES === 'true'; // Rutas de debug opcionales
 
-// Rate limit conservador (por IP) — ajusta a tu gusto
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false
-});
-app.use(limiter);
-
-// Middleware de auth que devuelve 404 si no pasa
-function auth404(req, res, next) {
-  try {
-    const key = req.get('x-api-key');
-    const ua  = req.get('User-Agent') || '';
-    // Requisitos mínimos: clave correcta y User-Agent esperado
-    if (!API_KEY || key !== API_KEY) return res.status(404).send('Not Found'); // <- "como si no existiera"
-    if (UA_LOCK && !ua.startsWith(UA_LOCK)) return res.status(404).send('Not Found');
-    return next();
-  } catch {
-    return res.status(404).send('Not Found');
+// ---------- Middleware de Auth ----------
+function requireApiKey(req, res, next) {
+  // Lee cabecera x-api-key
+  const key = req.get('x-api-key');
+  if (!API_KEY || key !== API_KEY) {
+    // Cambia a 404 si prefieres "como si no existiera":
+    // return res.status(404).send('Not Found');
+    return res.status(401).send('No autorizado');
   }
+  next();
 }
 
-// Oculta raíz
+// ---------- Ocultar raíz ----------
 app.get('/', (_req, res) => res.status(404).send('Not Found'));
 
-// Endpoint principal protegido
-app.get('/obtener-script', auth404, async (_req, res) => {
+// ---------- Endpoint protegido ----------
+app.get('/obtener-script', requireApiKey, async (_req, res) => {
   if (!TARGET_URL) return res.status(500).send('Server misconfigured');
 
   try {
-    const headers = {};
+    // Headers para el upstream si lo necesitas (GitHub token, etc.)
+    const upstreamHeaders = {};
     if (process.env.GITHUB_TOKEN) {
-      headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
-      headers['User-Agent'] = 'mySpiderApp';
-      headers.Accept = 'application/vnd.github+json';
+      upstreamHeaders.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+      upstreamHeaders['User-Agent'] = 'mySpiderApp';
+      upstreamHeaders.Accept = 'application/vnd.github+json';
     }
-    if (process.env.API_KEY) {
-      headers['x-api-key'] = process.env.API_KEY;
+    // Si tu upstream también requiere otra API key, usa una variable distinta:
+    if (process.env.UPSTREAM_API_KEY) {
+      upstreamHeaders['x-api-key'] = process.env.UPSTREAM_API_KEY;
     }
 
-    const r = await axios.get(TARGET_URL, { headers, timeout: 15000, validateStatus: () => true });
-    // No reveles detalles: si el upstream falla, responde genérico
-    if (r.status >= 200 && r.status < 300) return res.status(200).send(r.data);
-    return res.status(502).send('Upstream error'); // respuesta opaca
-  } catch {
-    // No revelar stack ni mensajes: mantenerlo opaco
+    // validateStatus: aceptamos cualquier status y lo manejamos nosotros
+    const r = await axios.get(TARGET_URL, {
+      headers: upstreamHeaders,
+      timeout: 15000,
+      validateStatus: () => true
+    });
+
+    if (r.status >= 200 && r.status < 300) {
+      // Entrega el contenido tal cual (tu script Lua ofuscado, etc.)
+      return res.status(200).send(r.data);
+    }
+    // Respuesta opaca en fallos del upstream (no revelar detalles)
+    return res.status(502).send('Upstream error');
+  } catch (_e) {
     return res.status(502).send('Upstream error');
   }
 });
 
-// (Opcional) rutas de debug solo en desarrollo
-if (process.env.DEBUG_ROUTES === 'true') {
-  const axiosBase = axios.create({ headers: { 'User-Agent': 'mySpiderApp' }});
+// ---------- (Opcional) Rutas de debug solo si DEBUG_ROUTES=true ----------
+if (DEBUG_ROUTES) {
   app.get('/debug/github-public', async (_req, res) => {
     try {
-      const r = await axiosBase.get('https://api.github.com/rate_limit');
+      const r = await axios.get('https://api.github.com/rate_limit', {
+        headers: { 'User-Agent': 'mySpiderApp' }
+      });
       res.status(r.status).send(r.data);
     } catch (e) {
       res.status(e.response?.status || 500).send(e.response?.data || e.message);
     }
   });
+
   app.get('/debug/github-me', async (_req, res) => {
     try {
       const r = await axios.get('https://api.github.com/user', {
@@ -95,9 +93,10 @@ if (process.env.DEBUG_ROUTES === 'true') {
   });
 }
 
-// 404 por defecto en todo lo demás
+// ---------- 404 por defecto ----------
 app.use((_req, res) => res.status(404).send('Not Found'));
 
+// ---------- Arranque ----------
 app.listen(PORT, () => {
   console.log(`Servidor corriendo en :${PORT}`);
 });
