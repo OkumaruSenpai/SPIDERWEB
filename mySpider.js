@@ -21,7 +21,7 @@ function requireApiKey(req, res, next) {
   if (!API_KEY || key !== API_KEY) {
     // Cambia a 404 si prefieres "como si no existiera":
     // return res.status(404).send('Not Found');
-    return res.status(401).send('No autorizado');
+    return res.status(401).send('¿Que haces aqui?');
   }
   next();
 }
